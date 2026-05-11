@@ -317,57 +317,66 @@ async def import_excel(
     
     try:
         wb = openpyxl.load_workbook(filename=io.BytesIO(contents), data_only=True)
-        ws = wb.active
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Excel dosyası okunamadı: {str(e)}")
         
-    # Tüm sayfaları kontrol et ve doğru başlığı bul
+    # Turkish character normalization for robust matching
+    def normalize_header(h):
+        if not h: return ""
+        # Standardize Turkish characters to avoid lowercase issues (I -> i vs ı)
+        return str(h).lower().strip().replace('ı', 'i').replace('İ', 'i').replace('ü', 'u').replace('ö', 'o').replace('ş', 's').replace('ğ', 'g').replace('ç', 'c')
+
     ws = None
-    header_row = None
-    header_row_idx = 1
+    header_row_idx = -1
     name_idx = -1
+    found_headers = []
     
+    # Try to find a sheet with a header row
     for sheet in wb.worksheets:
-        for idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=15, values_only=True), 1):
-            if not row:
-                continue
-            headers = [str(h).lower().strip() if h else "" for h in row]
-            for i, h in enumerate(headers):
-                if h in ["malzeme adı", "ürün adı", "ürün", "malzeme", "ad"] or "malzeme adı" in h or "ürün adı" in h:
-                    name_idx = i
-                    header_row = headers
-                    header_row_idx = idx
-                    ws = sheet
-                    break
-            if header_row:
-                break
-        if ws:
-            break
+        for idx, row in enumerate(sheet.iter_rows(min_row=1, max_row=20, values_only=True), 1):
+            if not row: continue
             
-    if not ws or not header_row or name_idx == -1:
-        raise HTTPException(status_code=400, detail="Excel dosyasındaki hiçbir sayfada 'Malzeme Adı' veya 'Ürün Adı' içeren bir başlık satırı bulunamadı.")
+            # Normalize all headers in this row
+            normalized_row = [normalize_header(h) for h in row]
+            
+            # Search for product name column
+            for i, h in enumerate(normalized_row):
+                if any(key in h for key in ["malzeme", "urun", "ad"]) and not any(ex in h for ex in ["kod", "no", "id"]):
+                    # Check if it looks like a name column (at least "ad" or "malzeme" or "urun")
+                    if h in ["malzeme adi", "urun adi", "urun", "malzeme", "ad"] or "malzeme adi" in h or "urun adi" in h:
+                        name_idx = i
+                        header_row_idx = idx
+                        found_headers = normalized_row
+                        ws = sheet
+                        break
+            if ws: break
+        if ws: break
+            
+    if not ws or name_idx == -1:
+        raise HTTPException(status_code=400, detail="Excel dosyasında 'Malzeme Adı' veya 'Ürün Adı' sütunu bulunamadı. Lütfen başlık satırını kontrol edin.")
         
+    # Performance Optimization: Pre-fetch existing product names for this warehouse
+    existing_products = db.query(Product.name).filter(Product.warehouse_id == warehouse_id).all()
+    existing_names_set = {p[0].lower().strip() for p in existing_products}
+    
     added_count = 0
     skipped_count = 0
     
+    # Iterate through rows starting from after the header
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-        if not row or name_idx >= len(row) or not row[name_idx]:
+        if not row or name_idx >= len(row) or row[name_idx] is None:
             continue
             
         name = str(row[name_idx]).strip()
-        if not name or name.lower() == "none" or name.lower() == "nan":
+        if not name or name.lower() in ["none", "nan", "null"]:
             continue
-        
-        # Kopya kontrolü
-        existing = db.query(Product).filter(
-            func.lower(Product.name) == name.lower(),
-            Product.warehouse_id == warehouse_id
-        ).first()
-        
-        if existing:
+            
+        # Check for duplicates using the pre-fetched set (O(1) instead of database query per row)
+        if name.lower() in existing_names_set:
             skipped_count += 1
             continue
             
+        # Default values
         category = "Genel / Dayanıklı Malzeme"
         description = ""
         current_stock = 0
@@ -375,23 +384,32 @@ async def import_excel(
         ideal_stock = 100
         status = "Çalışan"
         
-        # Diğer sütunları eşleştir
-        for i, h in enumerate(headers):
+        # Map other columns
+        for i, h in enumerate(found_headers):
             if i >= len(row) or row[i] is None:
                 continue
+                
             val = row[i]
             if "kategori" in h or "category" in h:
                 category = str(val).strip()
-            elif "açıklama" in h or "desc" in h:
+            elif "aciklama" in h or "desc" in h:
                 description = str(val).strip()
             elif "mevcut" in h or ("stok" in h and "kritik" not in h and "ideal" not in h):
-                try: current_stock = int(float(val))
+                try: 
+                    # Handle possible string numbers with commas
+                    if isinstance(val, str):
+                        val = val.replace(',', '.')
+                    current_stock = int(float(val))
                 except: pass
             elif "kritik" in h:
-                try: critical_stock = int(float(val))
+                try: 
+                    if isinstance(val, str): val = val.replace(',', '.')
+                    critical_stock = int(float(val))
                 except: pass
             elif "ideal" in h:
-                try: ideal_stock = int(float(val))
+                try: 
+                    if isinstance(val, str): val = val.replace(',', '.')
+                    ideal_stock = int(float(val))
                 except: pass
             elif "durum" in h or "status" in h:
                 status = str(val).strip()
@@ -408,10 +426,16 @@ async def import_excel(
         )
         
         db.add(product)
+        # Add to set to prevent duplicates within the same import file
+        existing_names_set.add(name.lower())
         added_count += 1
         
     if added_count > 0:
-        db.commit()
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Veritabanına kaydetme sırasında hata oluştu: {str(e)}")
         
     return {
         "message": "İçe aktarma tamamlandı.",
