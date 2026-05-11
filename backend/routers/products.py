@@ -12,6 +12,7 @@ import os
 import uuid
 import shutil
 from supabase_utils import upload_file_to_supabase
+import re
 
 
 router = APIRouter(prefix="/api/products", tags=["Products"])
@@ -386,33 +387,58 @@ async def import_excel(
         
         # Map other columns
         for i, h in enumerate(found_headers):
-            if i >= len(row) or row[i] is None:
+            if i >= len(row) or row[i] is None or i == name_idx:
                 continue
                 
             val = row[i]
-            if "kategori" in h or "category" in h:
+            # Category: kategori, tür, tip, grup
+            if any(k in h for k in ["kategori", "tur", "tip", "grup"]):
                 category = str(val).strip()
-            elif "aciklama" in h or "desc" in h:
+            # Description: açıklama, detay, not, bilgi
+            elif any(k in h for k in ["aciklama", "detay", "not", "bilgi", "desc"]):
                 description = str(val).strip()
-            elif "mevcut" in h or ("stok" in h and "kritik" not in h and "ideal" not in h):
+            # Current Stock: mevcut, miktar, adet, stok, birim
+            elif any(k in h for k in ["mevcut", "miktar", "adet", "birim"]) or ("stok" in h and not any(x in h for x in ["kritik", "min", "ideal", "max", "hedef"])):
                 try: 
-                    # Handle possible string numbers with commas
-                    if isinstance(val, str):
-                        val = val.replace(',', '.')
-                    current_stock = int(float(val))
+                    s_val = str(val).replace(',', '.')
+                    # Extract first number from string (e.g. "6 Adet" -> 6)
+                    num_match = re.search(r'(\d+)', s_val)
+                    if num_match:
+                        current_stock = int(num_match.group(1))
                 except: pass
-            elif "kritik" in h:
+            # Critical Stock: kritik, min, eşik, alt
+            elif any(k in h for k in ["kritik", "min", "esik", "alt"]):
                 try: 
-                    if isinstance(val, str): val = val.replace(',', '.')
-                    critical_stock = int(float(val))
+                    s_val = str(val).replace(',', '.')
+                    num_match = re.search(r'(\d+)', s_val)
+                    if num_match:
+                        critical_stock = int(num_match.group(1))
                 except: pass
-            elif "ideal" in h:
+            # Ideal Stock: ideal, max, hedef, üst
+            elif any(k in h for k in ["ideal", "max", "hedef", "ust"]):
                 try: 
-                    if isinstance(val, str): val = val.replace(',', '.')
-                    ideal_stock = int(float(val))
+                    s_val = str(val).replace(',', '.')
+                    num_match = re.search(r'(\d+)', s_val)
+                    if num_match:
+                        ideal_stock = int(num_match.group(1))
                 except: pass
-            elif "durum" in h or "status" in h:
-                status = str(val).strip()
+            # Status: durum, statü, hal, calisir, bozuk, yok
+            elif any(k in h for k in ["durum", "statu", "hal", "status", "calisir", "bozuk", "yok", "kismen"]):
+                val_str = str(val).lower().strip()
+                # If the column header itself indicates a status and the cell is not empty
+                if val_str and val_str not in ["none", "nan", "-"]:
+                    if "calisir" in h or "tam" in h:
+                        status = "Çalışan"
+                    elif "bozuk" in h or "yok" in h or "kismen" in h:
+                        status = "Bozuk / Kırık"
+                    else:
+                        # Generic status value mapping
+                        if val_str in ["yok", "bozuk", "kirik", "hayir"]:
+                            status = "Bozuk / Kırık"
+                        elif val_str in ["var", "evet", "calisiyor", "tam", "calisir"]:
+                            status = "Çalışan"
+                        else:
+                            status = str(val).strip()
                 
         product = Product(
             name=name,
@@ -437,8 +463,9 @@ async def import_excel(
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Veritabanına kaydetme sırasında hata oluştu: {str(e)}")
         
+    detected_cols = [h for h in found_headers if h]
     return {
-        "message": "İçe aktarma tamamlandı.",
+        "message": f"İçe aktarma tamamlandı. (Saptanan sütunlar: {', '.join(detected_cols)})",
         "added": added_count,
         "skipped": skipped_count
     }
